@@ -133,15 +133,34 @@ def render_score_card(result: dict):
             fig = go.Figure()
             names = [v["name"][:30] for v in vars_]
             contribs = [v["contribution"] for v in vars_]
-            colors = ["#22c55e" if c >= 0 else "#ef4444" for c in contribs]
+
+            # Determine if higher contribution = more risk or more safety
+            # Models where higher score = MORE RISK (positive contribution is bad):
+            #   Logistic Regression, Beneish M-Score, XGBoost
+            # Models where higher score = MORE SAFETY (positive contribution is good):
+            #   ISDS sector models, Altman Z-Score, Grover G-Score
+            direction = result.get("direction", "")
+            higher_is_riskier = any(kw in direction.lower() for kw in
+                                    ["lower = safer", "probability", "manipulation", "distress prob"])
+
+            if higher_is_riskier:
+                # Positive contribution = more risk = RED; negative = less risk = GREEN
+                colors = ["#ef4444" if c >= 0 else "#22c55e" for c in contribs]
+            else:
+                # Positive contribution = safer = GREEN; negative = riskier = RED
+                colors = ["#22c55e" if c >= 0 else "#ef4444" for c in contribs]
+
             fig.add_trace(go.Bar(x=contribs, y=names, orientation="h",
                                  marker_color=colors, text=[f"{c:.3f}" for c in contribs],
                                  textposition="outside"))
-            fig.update_layout(title="Variable Contributions", height=max(250, len(vars_)*45),
-                              margin=dict(l=0, r=40, t=40, b=0),
-                              xaxis_title="Contribution to Score",
-                              yaxis=dict(autorange="reversed"),
-                              template="plotly_dark")
+            fig.update_layout(
+                title=dict(text="Variable Contributions", font=dict(family="Times New Roman", size=14, color="#e2e8f0")),
+                font=dict(family="Raleway", size=11),
+                height=max(250, len(vars_)*45),
+                margin=dict(l=0, r=40, t=40, b=0),
+                xaxis_title="Contribution to Score",
+                yaxis=dict(autorange="reversed"),
+                template="plotly_dark")
             st.plotly_chart(fig, use_container_width=True)
 
 
@@ -149,38 +168,76 @@ def render_score_card(result: dict):
 # Helper: render gauge chart for overall risk
 # ---------------------------------------------------------------------------
 
-# === FIXED: Added unique keys to plotly_chart to fix StreamlitDuplicateElementId in merger analysis ===
+# === IMPROVED: Three separate gauges for Manipulation, Bankruptcy, and Distress ===
 def render_risk_gauge(results: list[dict], key: str = "risk_gauge"):
-    """Create a composite risk gauge from all model results."""
-    risk_scores = []
-    for r in results:
-        zone = r["zone"].lower()
-        if "safe" in zone or "healthy" in zone or "unlikely" in zone or "low" in zone:
-            risk_scores.append(1)
-        elif "grey" in zone or "monitor" in zone or "moderate" in zone:
-            risk_scores.append(2)
-        else:
-            risk_scores.append(3)
-    avg = sum(risk_scores) / len(risk_scores) if risk_scores else 2
+    """Render three separate risk gauges: Manipulation, Bankruptcy, and Financial Distress."""
 
-    fig = go.Figure(go.Indicator(
-        mode="gauge+number+delta",
-        value=avg,
-        title={"text": "Composite Risk Level", "font": {"size": 18}},
-        gauge={
-            "axis": {"range": [1, 3], "tickvals": [1, 1.5, 2, 2.5, 3],
-                     "ticktext": ["Safe", "", "Grey", "", "Distress"]},
-            "bar": {"color": "#60a5fa"},
-            "steps": [
-                {"range": [1, 1.67], "color": "#14532d"},
-                {"range": [1.67, 2.33], "color": "#713f12"},
-                {"range": [2.33, 3], "color": "#7f1d1d"},
-            ],
-            "threshold": {"line": {"color": "white", "width": 3}, "thickness": 0.8, "value": avg},
-        },
-    ))
-    fig.update_layout(height=280, margin=dict(t=50, b=10, l=30, r=30), template="plotly_dark")
-    st.plotly_chart(fig, use_container_width=True, key=key)
+    # Separate models into three distinct risk dimensions
+    manipulation = next((r for r in results if "Beneish" in r["model_name"]), None)
+    bankruptcy   = next((r for r in results if "Logistic" in r["model_name"]), None)
+    distress     = next((r for r in results if "XGBoost" in r["model_name"] or "ISDS" in r["model_name"]), None)
+
+    def _zone_to_num(zone: str) -> float:
+        z = zone.lower()
+        if "safe" in z or "unlikely" in z or "low" in z or "healthy" in z:
+            return 1.0
+        elif "grey" in z or "moderate" in z or "monitor" in z:
+            return 2.0
+        return 3.0
+
+    def _make_gauge(result: dict, title: str, key_suffix: str):
+        if result is None:
+            st.info(f"{title}: no data available.")
+            return
+        val = _zone_to_num(result["zone"])
+        color = {"green": "#22c55e", "orange": "#f59e0b", "red": "#ef4444"}.get(result["color"], "#60a5fa")
+        fig = go.Figure(go.Indicator(
+            mode="gauge+number",
+            value=val,
+            number={"font": {"size": 1}, "valueformat": ""},
+            title={"text": f"<b>{title}</b><br><span style='font-size:0.85em;color:{color}'>{result['zone']}</span>",
+                   "font": {"size": 13}},
+            gauge={
+                "axis": {"range": [1, 3], "tickvals": [1, 2, 3],
+                         "ticktext": ["Safe", "Grey", "Distress"],
+                         "tickfont": {"size": 10}},
+                "bar": {"color": color, "thickness": 0.3},
+                "steps": [
+                    {"range": [1, 1.67], "color": "#14532d"},
+                    {"range": [1.67, 2.33], "color": "#713f12"},
+                    {"range": [2.33, 3], "color": "#7f1d1d"},
+                ],
+                "threshold": {"line": {"color": "white", "width": 3},
+                              "thickness": 0.8, "value": val},
+            },
+        ))
+        fig.update_layout(height=220, margin=dict(t=80, b=10, l=20, r=20),
+                          template="plotly_dark")
+        st.plotly_chart(fig, use_container_width=True, key=f"{key}_{key_suffix}")
+
+    # Render three gauges side by side
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        _make_gauge(manipulation, "Manipulation Risk", "manip")
+    with col2:
+        _make_gauge(bankruptcy, "Bankruptcy Risk", "bank")
+    with col3:
+        _make_gauge(distress, "Financial Distress", "dist")
+
+    # Summary line below gauges
+    indicators = []
+    for r in [manipulation, bankruptcy, distress]:
+        if r:
+            z = r["zone"].lower()
+            if "safe" in z or "unlikely" in z or "low" in z or "healthy" in z:
+                indicators.append("🟢")
+            elif "grey" in z or "moderate" in z or "monitor" in z:
+                indicators.append("🟡")
+            else:
+                indicators.append("🔴")
+    safe_count = indicators.count("🟢")
+    st.markdown(f"**Risk Summary:** {' '.join(indicators)} — "
+                f"**{safe_count} of {len(indicators)} indicators in Safe Zone**")
 
 
 # ---------------------------------------------------------------------------
@@ -249,6 +306,29 @@ def data_input_panel(key_prefix: str = "") -> dict | list[dict] | None:
                     "Sector": data.get("sector_raw", ""),
                 }
                 st.json(preview)
+
+                # Download as CSV button — exports exact data dict in CSV upload format
+                import csv, io
+                csv_cols = [
+                    "ticker","company_name","industry","year",
+                    "total_assets","current_assets","current_liabilities","total_liabilities",
+                    "long_term_debt","total_debt","retained_earnings","total_equity",
+                    "cash_and_equivalents","revenue","gross_profit","ebit","net_income",
+                    "interest_expense","depreciation","sga_expense","operating_cash_flow",
+                    "market_cap","shares_outstanding","stock_price","revenue_prev",
+                    "net_ppe","receivables",
+                ]
+                buf = io.StringIO()
+                writer = csv.DictWriter(buf, fieldnames=csv_cols, extrasaction="ignore")
+                writer.writeheader()
+                writer.writerow({k: data.get(k, "") for k in csv_cols})
+                st.download_button(
+                    label="⬇ Download as CSV",
+                    data=buf.getvalue(),
+                    file_name=f"{data.get('ticker','company')}_{data.get('year','')}.csv",
+                    mime="text/csv",
+                    key=f"{key_prefix}_download_csv",
+                )
 
             return data
         return None
@@ -368,6 +448,14 @@ def render_valuation(data: dict, key_prefix: str = "single"):
     # Auto-estimate growth from historical financials
     est_growth = estimate_growth(data)
 
+    # Reset growth rate in session_state when ticker changes
+    # This ensures the field updates automatically for each new company
+    ticker_key = f"{key_prefix}_last_ticker"
+    growth_key = f"{key_prefix}_val_g"
+    if st.session_state.get(ticker_key) != ticker:
+        st.session_state[ticker_key] = ticker
+        st.session_state[growth_key] = float(est_growth)
+
     c1, c2, c3 = st.columns(3)
     with c1:
         rf = st.number_input("Risk-Free Rate (Rf)", value=0.043, format="%.4f", key=f"{key_prefix}_val_rf")
@@ -375,7 +463,7 @@ def render_valuation(data: dict, key_prefix: str = "single"):
         mrp = st.number_input("Market Risk Premium", value=0.055, format="%.4f", key=f"{key_prefix}_val_mrp")
     with c3:
         growth = st.number_input("Expected Growth Rate", value=float(est_growth),
-                                 format="%.3f", key=f"{key_prefix}_val_g",
+                                 format="%.3f", key=growth_key,
                                  help=f"Auto-estimated: {est_growth:.1%} (from historical financials). Adjust as needed.")
 
     with st.spinner("Estimating beta (5y weekly data)..."):
@@ -537,6 +625,345 @@ def main():
             styled = summary_df.style.map(_color_zone, subset=["Zone / Flag"])
             st.dataframe(styled, use_container_width=True, hide_index=True)
 
+            # ------------------------------------------------------------------
+            # Historical Score Trends (only for public tickers)
+            # ------------------------------------------------------------------
+            if d.get("ticker") and d["ticker"] != "MANUAL":
+                st.markdown("---")
+                with st.expander("Historical Score Trends", expanded=False):
+                    st.markdown("### **Historical Score Trends**")
+                    st.caption("Evolution of key risk scores over the last 4 available fiscal years. "
+                               "Helps identify whether risk is improving or deteriorating over time.")
+
+                    with st.spinner("Fetching historical data..."):
+                        try:
+                            import yfinance as yf
+                            tkr_hist = yf.Ticker(d["ticker"])
+                            bs_h   = tkr_hist.balance_sheet
+                            inc_h  = tkr_hist.income_stmt
+                            cf_h   = tkr_hist.cashflow
+
+                            # Get available years from balance sheet columns
+                            hist_years = []
+                            if bs_h is not None and not bs_h.empty:
+                                for col in bs_h.columns:
+                                    try:
+                                        yr = col.year if hasattr(col, "year") else int(str(col)[:4])
+                                        hist_years.append((yr, col))
+                                    except Exception:
+                                        continue
+                            hist_years = sorted(hist_years, key=lambda x: x[0])
+
+                            # Build the intersection of years available in ALL three dataframes
+                            def _years_in_df(df):
+                                result = set()
+                                if df is None or df.empty:
+                                    return result
+                                for c in df.columns:
+                                    try:
+                                        result.add(c.year if hasattr(c, "year") else int(str(c)[:4]))
+                                    except Exception:
+                                        continue
+                                return result
+
+                            bs_years  = _years_in_df(bs_h)
+                            inc_years = _years_in_df(inc_h)
+                            cf_years  = _years_in_df(cf_h)
+
+                            # Years with complete data in ALL three dataframes
+                            common_years = sorted(bs_years & inc_years & cf_years)
+
+                            # Only keep years where the PRIOR year also exists in both BS and IS
+                            # This guarantees valid Beneish calculation for every displayed year
+                            valid_years = [yr for yr in common_years
+                                           if (yr - 1) in bs_years and (yr - 1) in inc_years]
+
+                            # Filter hist_years to valid_years only
+                            hist_years = [(yr, col) for yr, col in hist_years if yr in valid_years]
+                            hist_years = sorted(hist_years, key=lambda x: x[0])
+
+                            if len(hist_years) >= 2:
+                                hist_records = []
+                                for i, (yr, col) in enumerate(hist_years):
+                                    try:
+                                        idx_h  = list(bs_h.columns).index(col)
+                                        idx_hi = min(idx_h, len(inc_h.columns) - 1) if inc_h is not None and not inc_h.empty else 0
+                                        idx_hc = min(idx_h, len(cf_h.columns) - 1) if cf_h is not None and not cf_h.empty else 0
+
+                                        # Find prior year index in each dataframe independently
+                                        # by searching for the previous year's column directly
+                                        # This avoids cross-dataframe index misalignment
+                                        prev_yr = yr - 1
+
+                                        def _find_col_idx(df, target_year):
+                                            """Find column index for target_year in df. Returns None if not found."""
+                                            if df is None or df.empty:
+                                                return None
+                                            for ci, c in enumerate(df.columns):
+                                                try:
+                                                    cy = c.year if hasattr(c, "year") else int(str(c)[:4])
+                                                    if cy == target_year:
+                                                        return ci
+                                                except Exception:
+                                                    continue
+                                            return None
+
+                                        idx_prev_h  = _find_col_idx(bs_h,  prev_yr)
+                                        idx_prev_hi = _find_col_idx(inc_h, prev_yr)
+
+                                        # Both prior year columns guaranteed to exist (filtered above)
+                                        # Fallback only as safety net
+                                        if idx_prev_h  is None: idx_prev_h  = min(idx_h  + 1, len(bs_h.columns)  - 1)
+                                        if idx_prev_hi is None: idx_prev_hi = min(idx_hi + 1, len(inc_h.columns) - 1) if inc_h is not None and not inc_h.empty else 0
+
+                                        def _hv(df, labels, col_i):
+                                            if df is None or df.empty:
+                                                return 0.0
+                                            for lbl in labels:
+                                                if lbl in df.index:
+                                                    try:
+                                                        v = df.iloc[df.index.get_loc(lbl), col_i]
+                                                        if pd.notna(v) and math.isfinite(float(v)):
+                                                            return float(v)
+                                                    except Exception:
+                                                        continue
+                                            return 0.0
+
+                                        d_hist = {
+                                            "total_assets":       _hv(bs_h, ["Total Assets"], idx_h) or 1,
+                                            "current_assets":     _hv(bs_h, ["Current Assets", "Total Current Assets"], idx_h),
+                                            "current_liabilities":_hv(bs_h, ["Current Liabilities", "Total Current Liabilities"], idx_h),
+                                            "total_liabilities":  _hv(bs_h, ["Total Liabilities Net Minority Interest", "Total Liabilities"], idx_h),
+                                            "total_equity":       _hv(bs_h, ["Total Equity Gross Minority Interest", "Stockholders Equity"], idx_h),
+                                            "retained_earnings":  _hv(bs_h, ["Retained Earnings"], idx_h),
+                                            "total_debt":         _hv(bs_h, ["Total Debt"], idx_h),
+                                            "net_ppe":            _hv(bs_h, ["Net PPE", "Net Property Plant And Equipment"], idx_h),
+                                            "receivables":        _hv(bs_h, ["Accounts Receivable", "Net Receivable", "Receivables"], idx_h),
+                                            "securities":         _hv(bs_h, ["Available For Sale Securities", "Investments And Advances"], idx_h),
+                                            "cash_and_equivalents":_hv(bs_h, ["Cash And Cash Equivalents"], idx_h),
+                                            "short_term_investments":_hv(bs_h, ["Other Short Term Investments", "Short Term Investments"], idx_h),
+                                            "revenue":            _hv(inc_h, ["Total Revenue", "Revenue"], idx_hi) or 1,
+                                            "gross_profit":       _hv(inc_h, ["Gross Profit"], idx_hi),
+                                            "ebit":               _hv(inc_h, ["EBIT", "Operating Income"], idx_hi),
+                                            "net_income":         _hv(inc_h, ["Net Income", "Net Income Common Stockholders"], idx_hi),
+                                            "depreciation":       _hv(inc_h, ["Depreciation And Amortization In Income Statement", "Reconciled Depreciation"], idx_hi),
+                                            "sga_expense":        _hv(inc_h, ["Selling General And Administration"], idx_hi),
+                                            "operating_expenses": _hv(inc_h, ["Total Operating Expenses", "Operating Expense"], idx_hi),
+                                            "operating_cash_flow":_hv(cf_h,  ["Operating Cash Flow", "Cash Flow From Continuing Operating Activities"], idx_hc),
+                                            # Prior year for Beneish
+                                            "prev_revenue":       _hv(inc_h, ["Total Revenue", "Revenue"], idx_prev_hi) or 1,
+                                            "prev_gross_profit":  _hv(inc_h, ["Gross Profit"], idx_prev_hi),
+                                            "prev_total_assets":  _hv(bs_h,  ["Total Assets"], idx_prev_h) or 1,
+                                            "prev_receivables":   _hv(bs_h,  ["Accounts Receivable", "Net Receivable", "Receivables"], idx_prev_h),
+                                            "prev_ppe":           _hv(bs_h,  ["Net PPE", "Net Property Plant And Equipment"], idx_prev_h),
+                                            "prev_securities":    _hv(bs_h,  ["Available For Sale Securities", "Investments And Advances"], idx_prev_h),
+                                            "prev_depreciation":  _hv(inc_h, ["Depreciation And Amortization In Income Statement", "Reconciled Depreciation"], idx_prev_hi),
+                                            "prev_sga":           _hv(inc_h, ["Selling General And Administration"], idx_prev_hi),
+                                            "prev_total_debt":    _hv(bs_h,  ["Total Debt"], idx_prev_h),
+                                            "industry":           d.get("industry", "Manufacturing"),
+                                            "market_cap":         d.get("market_cap", 0),
+                                        }
+
+                                        from models import beneish_mscore, logistic_regression, run_xgboost_zscore
+
+                                        b_res  = beneish_mscore(d_hist)
+                                        lr_res = logistic_regression(d_hist)
+                                        xg_res = run_xgboost_zscore(d_hist)
+
+                                        beneish_val   = b_res["score"]
+                                        beneish_valid = True
+
+                                        hist_records.append({
+                                            "Year":                    yr,
+                                            "Beneish M-Score":         round(beneish_val, 4) if beneish_valid else None,
+                                            "Bankruptcy Prob (%)":     round(lr_res["score"] * 100, 1),
+                                            "XGBoost Distress Prob":   round(xg_res["score"] * 100, 1),
+                                            "Beneish Zone":            b_res["zone"] if beneish_valid else "N/A",
+                                            "Bankruptcy Zone":         lr_res["zone"],
+                                            "Distress Zone":           xg_res["zone"],
+                                        })
+                                    except Exception:
+                                        continue
+
+                                if hist_records:
+                                    df_hist = pd.DataFrame(hist_records).sort_values("Year")
+                                    years   = df_hist["Year"].tolist()
+
+                                    # ── Chart 1: Beneish M-Score ──────────────────
+                                    fig_b = go.Figure()
+
+                                    # Filter out None values for Beneish chart only
+                                    beneish_years  = [r["Year"] for r in hist_records if r["Beneish M-Score"] is not None]
+                                    beneish_vals   = [r["Beneish M-Score"] for r in hist_records if r["Beneish M-Score"] is not None]
+                                    beneish_zones  = [r["Beneish Zone"] for r in hist_records if r["Beneish M-Score"] is not None]
+
+                                    # Colour each point by zone
+                                    point_colors = [
+                                        "#22c55e" if "Unlikely" in z else "#ef4444"
+                                        for z in beneish_zones
+                                    ]
+
+                                    fig_b.add_trace(go.Scatter(
+                                        x=beneish_years, y=beneish_vals,
+                                        mode="lines+markers+text",
+                                        name="Beneish M-Score",
+                                        line=dict(color="#a78bfa", width=2.5),
+                                        marker=dict(size=12, color=point_colors,
+                                                    line=dict(color="#a78bfa", width=2)),
+                                        text=[f"{v:.2f}" for v in beneish_vals],
+                                        textposition="top center",
+                                        textfont=dict(size=11),
+                                    ))
+
+                                    # Danger zone shading above -1.78
+                                    y_max = max(max(beneish_vals) + 0.3, -1.5) if beneish_vals else -1.5
+                                    fig_b.add_hrect(
+                                        y0=-1.78, y1=y_max,
+                                        fillcolor="#ef4444", opacity=0.08,
+                                        layer="below", line_width=0,
+                                    )
+                                    fig_b.add_hline(
+                                        y=-1.78, line_dash="dash",
+                                        line_color="#ef4444", line_width=1.5,
+                                        annotation_text="⚠️ Manipulation threshold (-1.78)",
+                                        annotation_position="top right",
+                                        annotation_font=dict(color="#ef4444", size=11),
+                                    )
+
+                                    fig_b.update_layout(
+                                        title=dict(text="Beneish M-Score — Manipulation Risk Over Time",
+                                                   font=dict(size=15, family="Times New Roman", color="#e2e8f0")),
+                                        font=dict(family="Raleway", size=11),
+                                        template="plotly_dark",
+                                        height=320,
+                                        margin=dict(t=60, b=40, l=60, r=20),
+                                        yaxis=dict(title="M-Score (higher = more risk)",
+                                                   gridcolor="#334155"),
+                                        xaxis=dict(tickmode="array", tickvals=beneish_years,
+                                                   gridcolor="#334155"),
+                                        showlegend=False,
+                                        plot_bgcolor="#0f172a",
+                                    )
+                                    st.plotly_chart(fig_b, use_container_width=True,
+                                                    key=f"hist_beneish_{d.get('ticker','')}")
+
+                                    # ── Chart 2: Bankruptcy & Distress Probabilities ──
+                                    fig_p = go.Figure()
+
+                                    bankr_vals = df_hist["Bankruptcy Prob (%)"].tolist()
+                                    xgb_vals   = df_hist["XGBoost Distress Prob"].tolist()
+
+                                    # Avoid label overlap: if values within 8 points, force one above one below
+                                    bankr_pos = []
+                                    xgb_pos   = []
+                                    for bv, xv in zip(bankr_vals, xgb_vals):
+                                        if abs(bv - xv) < 8:
+                                            bankr_pos.append("top center")
+                                            xgb_pos.append("bottom center")
+                                        else:
+                                            bankr_pos.append("top center" if bv >= xv else "bottom center")
+                                            xgb_pos.append("bottom center" if bv >= xv else "top center")
+
+                                    # Bankruptcy probability — single amber color
+                                    fig_p.add_trace(go.Scatter(
+                                        x=years, y=bankr_vals,
+                                        mode="lines+markers+text",
+                                        name="Bankruptcy Probability",
+                                        line=dict(color="#f59e0b", width=2.5),
+                                        marker=dict(size=10, color="#f59e0b"),
+                                        text=[f"{v:.1f}%" for v in bankr_vals],
+                                        textposition=bankr_pos,
+                                        textfont=dict(size=11, color="#f59e0b"),
+                                    ))
+
+                                    # XGBoost distress probability — single blue color
+                                    fig_p.add_trace(go.Scatter(
+                                        x=years, y=xgb_vals,
+                                        mode="lines+markers+text",
+                                        name="XGBoost Distress Score",
+                                        line=dict(color="#60a5fa", width=2.5),
+                                        marker=dict(size=10, color="#60a5fa"),
+                                        text=[f"{v:.1f}%" for v in xgb_vals],
+                                        textposition=xgb_pos,
+                                        textfont=dict(size=11, color="#60a5fa"),
+                                    ))
+
+                                    # Sector-specific XGBoost safe threshold (convert to %)
+                                    industry = d.get("industry", "Manufacturing")
+                                    _XGB_SECTOR_THRESHOLDS = {
+                                        "Healthcare":    0.470974,
+                                        "Technology":    0.499104,
+                                        "Manufacturing": 0.506821,
+                                        "Energy":        0.442242,
+                                        "Construction":  0.370449,
+                                        "Airline":       0.084938,
+                                        "Agriculture":   0.420772,
+                                    }
+                                    xgb_safe_pct = _XGB_SECTOR_THRESHOLDS.get(industry, 0.506821) * 100
+
+                                    # Bankruptcy high risk threshold (40%) — amber
+                                    fig_p.add_hline(
+                                        y=40, line_dash="dot",
+                                        line_color="#f59e0b", line_width=1.5, opacity=0.8,
+                                        annotation_text=f"⚠ Bankruptcy high risk (40%)",
+                                        annotation_position="right",
+                                        annotation_font=dict(color="#f59e0b", size=10),
+                                    )
+                                    # XGBoost sector-specific safe threshold — blue
+                                    fig_p.add_hline(
+                                        y=xgb_safe_pct, line_dash="dot",
+                                        line_color="#60a5fa", line_width=1.5, opacity=0.8,
+                                        annotation_text=f"⚠ XGBoost safe limit ({xgb_safe_pct:.1f}% — {industry})",
+                                        annotation_position="right",
+                                        annotation_font=dict(color="#60a5fa", size=10),
+                                    )
+
+                                    fig_p.update_layout(
+                                        title=dict(text="Bankruptcy & Distress Probability Over Time",
+                                                   font=dict(size=15, family="Times New Roman", color="#e2e8f0")),
+                                        font=dict(family="Raleway", size=11),
+                                        template="plotly_dark",
+                                        height=350,
+                                        margin=dict(t=60, b=40, l=60, r=100),
+                                        yaxis=dict(title="Probability (%)", range=[0, 100],
+                                                   gridcolor="#334155"),
+                                        xaxis=dict(tickmode="array", tickvals=years,
+                                                   gridcolor="#334155"),
+                                        legend=dict(orientation="h", yanchor="bottom",
+                                                    y=1.02, xanchor="right", x=1),
+                                        plot_bgcolor="#0f172a",
+                                    )
+                                    st.plotly_chart(fig_p, use_container_width=True,
+                                                    key=f"hist_prob_{d.get('ticker','')}")
+
+                                    # Summary table
+                                    display_df = df_hist[["Year", "Beneish M-Score",
+                                                           "Bankruptcy Prob (%)", "XGBoost Distress Prob",
+                                                           "Beneish Zone", "Bankruptcy Zone", "Distress Zone"]].copy()
+                                    display_df["Beneish M-Score"] = display_df["Beneish M-Score"].round(4)
+
+                                    def _color_zone_hist(val):
+                                        v = str(val).lower()
+                                        if "safe" in v or "unlikely" in v or "low risk" in v:
+                                            return "background-color: #14532d; color: white"
+                                        elif "grey" in v or "moderate" in v or "monitor" in v:
+                                            return "background-color: #713f12; color: white"
+                                        elif "high risk" in v or "distress" in v or ("manipulator" in v and "unlikely" not in v):
+                                            return "background-color: #7f1d1d; color: white"
+                                        return ""
+
+                                    styled_hist = display_df.style.map(
+                                        _color_zone_hist,
+                                        subset=["Beneish Zone", "Bankruptcy Zone", "Distress Zone"]
+                                    )
+                                    st.dataframe(styled_hist, use_container_width=True, hide_index=True)
+                                else:
+                                    st.info("Could not compute historical scores — insufficient data.")
+                            else:
+                                st.info("Historical data requires at least 2 years of financial statements.")
+                        except Exception as e:
+                            st.warning(f"Historical trend analysis unavailable: {e}")
+
             # Individual model cards
             st.markdown("### Detailed Model Results")
             for r in results:
@@ -694,6 +1121,92 @@ def main():
                 styled_syn = syn_df.style.map(_color_syn, subset=["Synergy Level"])
                 st.dataframe(styled_syn, use_container_width=True, hide_index=True)
 
+                # --- Key Financial Ratios Comparison Table ---
+                st.markdown("### Key Financial Ratios Comparison")
+                st.caption("Side-by-side comparison of the most relevant M&A screening ratios. "
+                           "Gap = Acquirer minus Target. Signal indicates strategic fit.")
+
+                def _safe_ratio(num, den):
+                    try:
+                        return num / den if den and den != 0 else None
+                    except Exception:
+                        return None
+
+                def _fmt_ratio(val, pct=False):
+                    if val is None:
+                        return "N/A"
+                    if pct:
+                        return f"{val:.1%}"
+                    return f"{val:.2f}x"
+
+                def _signal(gap, higher_better=True):
+                    if gap is None:
+                        return "—"
+                    if higher_better:
+                        return "✅ Acquirer stronger" if gap > 0.05 else ("⚠️ Target stronger" if gap < -0.05 else "➡️ Similar")
+                    else:
+                        return "✅ Acquirer less leveraged" if gap < -0.05 else ("⚠️ Acquirer more leveraged" if gap > 0.05 else "➡️ Similar")
+
+                ta_a  = data_a.get("total_assets", 1) or 1
+                ta_t  = data_t.get("total_assets", 1) or 1
+                tl_a  = data_a.get("total_liabilities", 0)
+                tl_t  = data_t.get("total_liabilities", 0)
+                ni_a  = data_a.get("net_income", 0)
+                ni_t  = data_t.get("net_income", 0)
+                rev_a = data_a.get("revenue", 1) or 1
+                rev_t = data_t.get("revenue", 1) or 1
+                ca_a  = data_a.get("current_assets", 0)
+                ca_t  = data_t.get("current_assets", 0)
+                cl_a  = data_a.get("current_liabilities", 1) or 1
+                cl_t  = data_t.get("current_liabilities", 1) or 1
+                ocf_a = data_a.get("operating_cash_flow", 0)
+                ocf_t = data_t.get("operating_cash_flow", 0)
+                gp_a  = data_a.get("gross_profit", 0)
+                gp_t  = data_t.get("gross_profit", 0)
+
+                roa_a     = _safe_ratio(ni_a, ta_a)
+                roa_t     = _safe_ratio(ni_t, ta_t)
+                lev_a     = _safe_ratio(tl_a, ta_a)
+                lev_t     = _safe_ratio(tl_t, ta_t)
+                liq_a     = _safe_ratio(ca_a, cl_a)
+                liq_t     = _safe_ratio(ca_t, cl_t)
+                margin_a  = _safe_ratio(gp_a, rev_a)
+                margin_t  = _safe_ratio(gp_t, rev_t)
+                ocf_ta_a  = _safe_ratio(ocf_a, ta_a)
+                ocf_ta_t  = _safe_ratio(ocf_t, ta_t)
+                asset_a   = _safe_ratio(rev_a, ta_a)
+                asset_t   = _safe_ratio(rev_t, ta_t)
+
+                ratio_rows = [
+                    ("ROA (Net Income / Assets)",      _fmt_ratio(roa_a, pct=True),  _fmt_ratio(roa_t, pct=True),  (roa_a - roa_t) if roa_a is not None and roa_t is not None else None,   True,  "Profitability"),
+                    ("Leverage (Liabilities / Assets)",_fmt_ratio(lev_a, pct=True),  _fmt_ratio(lev_t, pct=True),  (lev_a - lev_t) if lev_a is not None and lev_t is not None else None,   False, "Solvency"),
+                    ("Liquidity (Current Ratio)",      _fmt_ratio(liq_a),             _fmt_ratio(liq_t),             (liq_a - liq_t) if liq_a is not None and liq_t is not None else None,   True,  "Liquidity"),
+                    ("Gross Margin",                   _fmt_ratio(margin_a, pct=True),_fmt_ratio(margin_t, pct=True),(margin_a - margin_t) if margin_a is not None and margin_t is not None else None, True, "Profitability"),
+                    ("OCF / Assets",                   _fmt_ratio(ocf_ta_a, pct=True),_fmt_ratio(ocf_ta_t, pct=True),(ocf_ta_a - ocf_ta_t) if ocf_ta_a is not None and ocf_ta_t is not None else None, True, "Cash Generation"),
+                    ("Asset Turnover (Rev / Assets)",  _fmt_ratio(asset_a),           _fmt_ratio(asset_t),           (asset_a - asset_t) if asset_a is not None and asset_t is not None else None, True, "Efficiency"),
+                ]
+
+                name_a_short = data_a.get("company_name") or data_a.get("ticker", "Acquirer")
+                name_t_short = data_t.get("company_name") or data_t.get("ticker", "Target")
+
+                ratio_df = pd.DataFrame([{
+                    "Ratio": row[0],
+                    "Category": row[5],
+                    name_a_short[:15]: row[1],
+                    name_t_short[:15]: row[2],
+                    "Signal": _signal(row[3], row[4]),
+                } for row in ratio_rows])
+
+                def _color_signal(val):
+                    if "✅" in str(val):
+                        return "background-color: #14532d; color: white"
+                    elif "⚠️" in str(val):
+                        return "background-color: #713f12; color: white"
+                    return ""
+
+                styled_ratio = ratio_df.style.map(_color_signal, subset=["Signal"])
+                st.dataframe(styled_ratio, use_container_width=True, hide_index=True)
+
                 # --- Side-by-side scores ---
                 st.markdown("### Individual Company Scores")
                 col_a, col_t = st.columns(2)
@@ -794,9 +1307,12 @@ def main():
                                                      theta=categories + [categories[0]],
                                                      fill="toself", name="Target",
                                                      line_color="#f59e0b"))
-                fig_radar.update_layout(polar=dict(radialaxis=dict(visible=True, range=[0, 1])),
-                                         template="plotly_dark", height=450,
-                                         title="Normalised Risk Profile (higher = safer)")
+                fig_radar.update_layout(
+                    polar=dict(radialaxis=dict(visible=True, range=[0, 1])),
+                    template="plotly_dark", height=450,
+                    title=dict(text="Normalised Risk Profile (higher = safer)",
+                               font=dict(family="Times New Roman", size=14, color="#e2e8f0")),
+                    font=dict(family="Raleway", size=11))
                 st.plotly_chart(fig_radar, use_container_width=True)
 
                 # --- Valuation for each company ---
@@ -986,6 +1502,40 @@ def main():
                                          template="plotly_dark", height=320,
                                          margin=dict(t=50, b=30))
                     st.plotly_chart(fig_lm, use_container_width=True)
+
+                    # --- Top 5 words per category ---
+                    st.markdown("#### Top 5 Most Frequent Words by Category")
+                    st.caption("The most repeated words from each L&M dictionary category found in the filing.")
+                    top5_cols = st.columns(len(LM_CATEGORY_NAMES))
+                    cat_colors = {
+                        "Negative":     "#ef4444",
+                        "Positive":     "#22c55e",
+                        "Uncertainty":  "#f59e0b",
+                        "Litigious":    "#a78bfa",
+                        "Constraining": "#60a5fa",
+                        "Strong Modal": "#f472b6",
+                    }
+                    for j, cat_name in enumerate(LM_CATEGORY_NAMES):
+                        top5_key = f"{cat_name.lower()}_top5"
+                        top5 = lm_features.get(top5_key, [])
+                        color = cat_colors.get(cat_name, "#94a3b8")
+                        with top5_cols[j]:
+                            st.markdown(f"<p style='color:{color};font-weight:700;"
+                                        f"font-size:0.85rem;margin-bottom:4px'>{cat_name}</p>",
+                                        unsafe_allow_html=True)
+                            if top5:
+                                for word, freq in top5:
+                                    st.markdown(
+                                        f"<div style='display:flex;justify-content:space-between;"
+                                        f"padding:2px 6px;margin:2px 0;background:#1e293b;"
+                                        f"border-radius:4px;font-size:0.82rem'>"
+                                        f"<span style='color:#e2e8f0'>{word}</span>"
+                                        f"<span style='color:{color};font-weight:600'>{freq}x</span>"
+                                        f"</div>",
+                                        unsafe_allow_html=True
+                                    )
+                            else:
+                                st.caption("No words found")
 
                     st.caption(f"Total words analysed: {lm_features.get('total_words', 0):,} | "
                                f"Net Sentiment (Pos-Neg): {lm_features.get('net_sentiment', 0):.4f}")

@@ -20,55 +20,71 @@ from typing import Dict, Optional, Tuple
 
 
 # ---------------------------------------------------------------------------
+# Compact number formatter
+# ---------------------------------------------------------------------------
+
+def _fmt_compact(v: float) -> str:
+    """Format large numbers compactly: $1.2B, $345M, $12.3K."""
+    if v == 0:
+        return "$0"
+    sign = "-" if v < 0 else ""
+    abs_v = abs(v)
+    if abs_v >= 1e12:
+        return f"{sign}${abs_v/1e12:.2f}T"
+    if abs_v >= 1e9:
+        return f"{sign}${abs_v/1e9:.2f}B"
+    if abs_v >= 1e6:
+        return f"{sign}${abs_v/1e6:.1f}M"
+    if abs_v >= 1e3:
+        return f"{sign}${abs_v/1e3:.1f}K"
+    return f"{sign}${abs_v:,.0f}"
+
+
+# ---------------------------------------------------------------------------
 # Growth rate estimation from historical data
 # ---------------------------------------------------------------------------
 
 def estimate_growth(data: dict) -> float:
     """Estimate a reasonable growth rate from historical financial data.
 
-    Uses revenue growth and ROE-based sustainable growth, picks the best
-    positive estimate, and caps to a [3%, 35%] range.
+    Uses revenue growth as the primary signal — the most direct measure
+    of actual business expansion. Other methods serve as sanity checks only.
+    Caps to a [3%, 20%] range to avoid distortion from outliers.
     """
     rev = data.get("revenue", 0)
     prev_rev = data.get("revenue_prev", 0) or data.get("prev_revenue", 0)
 
-    # Method 1: Revenue growth (YoY)
+    # Method 1: Revenue growth (YoY) — PRIMARY signal
+    # This is the most direct measure of actual growth
     rev_growth = None
     if rev > 0 and prev_rev > 0:
-        rev_growth = (rev / prev_rev) - 1.0
+        raw = (rev / prev_rev) - 1.0
+        # Cap revenue growth at 25% to avoid one-off spikes
+        rev_growth = max(-0.20, min(raw, 0.25))
 
-    # Method 2: ROE-based sustainable growth  (g = ROE * retention_ratio)
-    # Cap ROE at 40% to avoid distortion from buyback-depleted equity
+    # Method 2: ROE-based sustainable growth (g = ROE * retention_ratio)
+    # Only used as a sanity check — capped aggressively to avoid
+    # distortion from buyback-depleted equity (e.g. Apple, McDonald's)
     ni = data.get("net_income", 0)
     eq = data.get("total_equity", 0)
     roe_growth = None
     if ni > 0 and eq > 0:
-        roe = min(ni / eq, 0.40)  # cap at 40% — high ROE from buybacks is not investable growth
-        roe_growth = roe * 0.70  # assume 70 % retention
+        roe = min(ni / eq, 0.20)  # hard cap at 20% — buybacks inflate ROE artificially
+        roe_growth = roe * 0.50   # conservative 50% retention assumption
 
-    # Method 3: EBITDA-based earnings power growth
-    ebitda = data.get("ebitda", 0)
-    ta = data.get("total_assets", 0)
-    ebitda_growth = None
-    if ebitda > 0 and ta > 0:
-        # Return on invested capital proxy — sustainable growth ≈ ROIC * retention
-        ebitda_margin = ebitda / ta
-        ebitda_growth = ebitda_margin * 0.6  # assume 60% reinvestment
+    # If we have revenue growth, use it directly with a light blend
+    if rev_growth is not None:
+        if roe_growth is not None:
+            # Blend: 70% revenue growth + 30% ROE-based (weighted toward actual growth)
+            blended = 0.70 * rev_growth + 0.30 * roe_growth
+        else:
+            blended = rev_growth
+        # Final cap: 3% floor, 20% ceiling
+        return round(max(0.03, min(blended, 0.20)), 4)
 
-    # Method 4: OCF-based growth proxy for capex-heavy companies
-    ocf = data.get("operating_cash_flow", 0)
-    ocf_growth = None
-    if ocf > 0 and ta > 0:
-        ocf_growth = (ocf / ta) * 0.5
-
-    # Use the median of positive candidates for a balanced estimate
-    # (max would be distorted by buyback-inflated ROE; median is more robust)
-    candidates = sorted([g for g in [rev_growth, roe_growth, ebitda_growth, ocf_growth]
-                         if g is not None and g > 0])
-    if candidates:
-        mid = len(candidates) // 2
-        growth = candidates[mid] if len(candidates) % 2 == 1 else (candidates[mid - 1] + candidates[mid]) / 2
-        return round(max(0.03, min(growth, 0.35)), 4)
+    # Fallback if no revenue data: use ROE-based only
+    if roe_growth is not None:
+        return round(max(0.03, min(roe_growth, 0.12)), 4)
 
     return 0.05  # conservative fallback
 
@@ -249,8 +265,8 @@ def intrinsic_value(data: dict, beta: float,
             projected_fcf.append({
                 "Year": yr,
                 "Growth": f"{yr_growth:.1%}",
-                "FCF": f"${cf:,.0f}",
-                "PV": f"${pv:,.0f}",
+                "FCF": _fmt_compact(cf),
+                "PV": _fmt_compact(pv),
                 "fcf_raw": cf,  # internal — stripped later
             })
         # Terminal value
@@ -261,8 +277,8 @@ def intrinsic_value(data: dict, beta: float,
         projected_fcf.append({
             "Year": "Terminal",
             "Growth": f"{terminal_growth:.1%}",
-            "FCF": f"${terminal_cf:,.0f}",
-            "PV": f"${tv_pv:,.0f}",
+            "FCF": _fmt_compact(terminal_cf),
+            "PV": _fmt_compact(tv_pv),
             "fcf_raw": terminal_cf,
         })
     dcf_per_share = dcf_value / shares if shares > 0 else 0
@@ -275,7 +291,9 @@ def intrinsic_value(data: dict, beta: float,
     # Method 2: Ben Graham formula
     # ============================================================
     # V = EPS * (8.5 + 2g) * 4.4 / Y
-    g_pct = growth_rate * 100
+    # Graham designed this formula for growth rates of 5-15%.
+    # Cap at 15% to avoid distortion from high-growth inputs.
+    g_pct = min(growth_rate * 100, 15.0)
     y_rate = max(risk_free * 100, 1.0)
     graham_value = eps * (8.5 + 2 * g_pct) * 4.4 / y_rate if eps > 0 else 0
 
